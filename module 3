@@ -1,0 +1,438 @@
+def build_prompt(
+    question: str,
+    context: str,
+) -> str:
+    return PROMPT_TEMPLATE.format(
+        context=context,
+        question=question,
+    )
+    from __future__ import annotations
+
+from pathlib import Path
+
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+
+ROOT = Path(__file__).resolve().parent
+DOCS_DIR = ROOT / "docs"
+CHROMA_DIR = ROOT / "chroma_db"
+
+COLLECTION_NAME = "zepto_policies"
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def load_documents():
+    documents = []
+    ids = []
+    metadatas = []
+
+    for path in sorted(DOCS_DIR.glob("doc_*.txt")):
+        text = path.read_text(encoding="utf-8").strip()
+
+        # Simple one-document-per-chunk strategy.
+        documents.append(text)
+        ids.append(path.stem)
+        metadatas.append(
+            {
+                "document_id": path.stem,
+                "source": path.name,
+            }
+        )
+
+    return ids, documents, metadatas
+
+
+def build_collection():
+    ids, documents, metadatas = load_documents()
+
+    model = SentenceTransformer(MODEL_NAME)
+
+    embeddings = model.encode(
+        documents,
+        normalize_embeddings=True,
+    ).tolist()
+
+    client = chromadb.PersistentClient(
+        path=str(CHROMA_DIR)
+    )
+
+    try:
+        collection = client.get_collection(
+            COLLECTION_NAME
+        )
+        collection.delete(
+            where={}
+        )
+    except Exception:
+        pass
+
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={
+            "hnsw:space": "cosine"
+        },
+    )
+
+    collection.add(
+        ids=ids,
+        documents=documents,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+
+    print(
+        f"Indexed {len(documents)} documents into "
+        f"Chroma collection '{COLLECTION_NAME}'."
+    )
+
+    return collection
+
+
+if __name__ == "__main__":
+    build_collection()
+
+13. Module 3 — support_assistant/rag.py
+from __future__ import annotations
+
+import os
+from typing import TypedDict
+
+import chromadb
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+from langgraph.graph import END, START, StateGraph
+
+from prompts import build_prompt
+
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+CHROMA_DIR = os.path.join(
+    ROOT,
+    "chroma_db",
+)
+
+COLLECTION_NAME = "zepto_policies"
+
+MODEL_NAME = (
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class SupportState(TypedDict, total=False):
+    query: str
+    intent: str
+    retrieved_documents: list[str]
+    retrieved_ids: list[str]
+    answer: AnswerResponse
+
+
+KEYWORDS = [
+    "delivery",
+    "return",
+    "refund",
+    "membership",
+    "tracking",
+    "cancel",
+    "gift card",
+    "support hours",
+]
+
+
+def mock_enabled() -> bool:
+    return os.getenv(
+        "MOCK_LLM",
+        "1",
+    ) != "0"
+
+
+def classify_intent(
+    state: SupportState,
+):
+    query = state["query"].lower()
+
+    intent = (
+        "policy_question"
+        if any(keyword in query for keyword in KEYWORDS)
+        else "general_question"
+    )
+
+    return {
+        "intent": intent
+    }
+
+
+def get_collection():
+    client = chromadb.PersistentClient(
+        path=CHROMA_DIR
+    )
+
+    return client.get_collection(
+        COLLECTION_NAME
+    )
+
+
+def retrieve(
+    query: str,
+):
+    model = SentenceTransformer(
+        MODEL_NAME
+    )
+
+    embedding = model.encode(
+        [query],
+        normalize_embeddings=True,
+    ).tolist()
+
+    collection = get_collection()
+
+    result = collection.query(
+        query_embeddings=embedding,
+        n_results=3,
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
+    )
+
+    documents = result["documents"][0]
+    ids = [
+        metadata["document_id"]
+        for metadata in result["metadatas"][0]
+    ]
+
+    return documents, ids
+
+
+def optional_real_llm_answer(
+    query: str,
+    documents: list[str],
+    ids: list[str],
+)
+
+try:
+        from langchain_groq import ChatGroq
+    except ImportError as exc:
+        return AnswerResponse(
+            answer=(
+                "ERROR: MOCK_LLM=0 requires an installed LangChain "
+                "LLM integration such as langchain-groq."
+            ),
+            sources=ids,
+            confidence=0.0,
+        )
+
+    prompt = build_prompt(
+        question=query,
+        context="\n\n".join(
+            f"[{doc_id}] {doc}"
+            for doc_id, doc in zip(ids, documents)
+        ),
+    )
+
+    llm = ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0,
+    )
+
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = llm.invoke(prompt)
+
+            raw = (
+                response.content
+                if hasattr(response, "content")
+                else str(response)
+            )
+
+            parsed = AnswerResponse.model_validate_json(
+                raw
+            )
+
+            return parsed
+
+        except Exception as exc:
+            last_error = exc
+
+def retrieve_and_answer(
+    state: SupportState,
+):
+    query = state["query"]
+
+    documents, ids = retrieve(query)
+
+    if mock_enabled():
+        top_chunk = documents[0][:200]
+
+        answer = AnswerResponse(
+            answer=(
+                "Based on the retrieved context: "
+                f"{top_chunk}"
+            ),
+            sources=ids,
+            confidence=1.0,
+        )
+
+    else:
+        answer = optional_real_llm_answer(
+            query,
+            documents,
+            ids,
+        )
+
+    return {
+        "retrieved_documents": documents,
+        "retrieved_ids": ids,
+        "answer": answer,
+    }
+
+
+def direct_answer(
+    state: SupportState,
+):
+    if mock_enabled():
+        answer = AnswerResponse(
+            answer=(
+                "I can only answer questions about Zepto "
+                "policies right now."
+            ),
+            sources=[],
+            confidence=1.0,
+        )
+    else:
+        return {
+        "answer": answer
+    }
+
+
+def route_intent(
+    state: SupportState,
+):
+    if state["intent"] == "policy_question":
+        return "retrieve_and_answer"
+
+    return "direct_answer"
+
+
+def build_graph():
+    graph = StateGraph(
+        SupportState
+    )
+
+    graph.add_node(
+        "classify_intent",
+        classify_intent,
+    )
+
+    graph.add_node(
+        "retrieve_and_answer",
+        retrieve_and_answer,
+    )
+
+    graph.add_node(
+        "direct_answer",
+        direct_answer,
+    )
+
+    graph.add_edge(
+        START,
+        "classify_intent",
+    )
+
+    graph.add_conditional_edges(
+        "classify_intent",
+        route_intent,
+        {
+            "retrieve_and_answer": "retrieve_and_answer",
+            "direct_answer": "direct_answer",
+        },
+    )
+
+    graph.add_edge(
+        "retrieve_and_answer",
+        END,
+    )
+
+    graph.add_edge(
+        "direct_answer",
+        END,
+    )
+
+    return graph.compile()
+
+
+GRAPH = build_graph()
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+from ingest import build_collection
+from rag import AnswerResponse, GRAPH
+
+
+app = FastAPI(
+    title="Zepto Support Assistant",
+    version="1.0.0",
+)
+
+
+class AskRequest(BaseModel):
+    query: str = Field(
+        min_length=1,
+        description="Customer support question",
+    )
+
+
+@app.on_event("startup")
+def startup():
+    """
+    Ensure the local Chroma collection exists.
+
+    The model and embeddings are local; no LLM provider is contacted in
+    MOCK_LLM=1 mode.
+    """
+    try:
+        build_collection()
+    except Exception as exc:
+        print(
+            "Chroma initialization warning:",
+            exc,
+        )
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+
+
+@app.post(
+    "/ask",
+    response_model=AnswerResponse,
+)
+def ask(
+    request: AskRequest,
+):
+    result = GRAPH.invoke(
+        {
+            "query": request.query
+        }
+    )
