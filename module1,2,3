@@ -1,0 +1,437 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+BASE_URL = "https://books.toscrape.com"
+RATE_GBP_TO_INR = 105.50
+
+ROOT = Path(__file__).resolve().parent
+DATABASE_DIR = ROOT / "database"
+OUTPUT_DIR = ROOT / "outputs"
+
+DATABASE_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATABASE_DIR / "books.sqlite3"
+
+RATING_MAP = {
+    "One": 1,
+    "Two": 2,
+    "Three": 3,
+    "Four": 4,
+    "Five": 5,
+}
+
+def get_soup(url: str) -> BeautifulSoup:
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0 Zepto-Data-Pipeline"},
+        )
+    response.raise_for_status()
+    return BeautifulSoup(response.text, "html.parser")
+
+def scrape_books(minimum_books: int = 60) -> pd.DataFrame:
+
+    rows = []
+
+    for page_number in range(1, 6):
+        if page_number == 1:
+            url = BASE_URL + "catalogue/page-1.html"
+        else:
+            url = BASE_URL + f"catalogue/page-{page_number}.html"
+            
+soup = get_soup(url)
+            
+for article in soup.select("article.product_pod"):
+            title_node = article.select_one("h3 a")
+            price_node = article.select_one(".price_color")
+            rating_node = article.select_one("p.star-rating")
+            availability_node = article.select_one(".availability")
+            
+            title = title_node.get("title", "").strip() if title_node else ""
+            price = price_node.get_text(strip=True) if price_node else ""
+            rating_text = ""
+            
+            if rating_node:
+                classes = rating_node.get("class", [])
+                rating_text = next(
+                    (value for value in classes if value in RATING_MAP),
+                    "",
+                )
+                
+availability = (
+                availability_node.get_text(" ", strip=True)
+                if availability_node
+                else ""
+            )
+             
+             
+category = "All Products"
+
+rows.append(
+   {
+    "title": title,
+    "price": price,
+    "star_rating": rating_text,
+    "availability": availability,
+    "category": category,
+        }
+    )
+
+print(f"Scraped page {page_number}: {len(rows)} cumulative rows")
+
+df = pd.DataFrame(rows)
+
+if len(df) < minimum_books:
+    raise RuntimeError(
+        f"Expected at least {minimum_books} books, got {len(df)}"
+    )
+
+return df
+
+
+def parse_price(value: str) -> float | None:
+    try:
+        cleaned = re.sub(r"[^\d.]", "", str(value))
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_rating(value: str) -> int | None:
+    return RATING_MAP.get(str(value).strip())
+
+
+def parse_stock(value: str) -> bool | None:
+    text = str(value).lower()
+
+    if "in stock" in text:
+        return True
+
+    if "out of stock" in text:
+        return False
+
+    return None
+
+
+def clean_data(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = raw_df.copy()
+
+    df["price_gbp"] = df["price"].apply(parse_price)
+    df["rating"] = df["star_rating"].apply(parse_rating)
+    df["in_stock"] = df["availability"].apply(parse_stock)
+    
+    for column in ["price_gbp", "rating"]:
+        if df[column].isna().any():
+            median_value = df[column].median()
+            df[column] = df[column].fillna(median_value)
+            
+before = len(df)
+df = df.dropna(subset=["in_stock"]).copy()
+dropped = before - len(df)
+
+if dropped:
+        print(f"Dropped {dropped} rows with unparseable availability.")
+        
+df["rating"] = df["rating"].astype(int)
+df["in_stock"] = df["in_stock"].astype(bool)
+
+df["price_inr"] = df["price_gbp"] * RATE_GBP_TO_INR
+
+final_columns = [
+        "title",
+        "price_gbp",
+        "price_inr",
+        "rating",
+        "in_stock",
+        "category",
+]
+
+df = df[final_columns].reset_index(drop=True)
+
+return df
+
+def create_database(df: pd.DataFrame) -> None:
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+        
+    connection = sqlite3.connect(DB_PATH)
+
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+connection.execute(
+            """
+            CREATE TABLE categories (
+                category_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_name TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+
+connection.execute(
+            """
+            CREATE TABLE books (
+                book_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                price_gbp REAL NOT NULL,
+                price_inr REAL NOT NULL,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                in_stock INTEGER NOT NULL CHECK (in_stock IN (0, 1)),
+                category_id INTEGER NOT NULL,
+                FOREIGN KEY (category_id)
+                    REFERENCES categories(category_id)
+            )
+            """
+        )
+
+categories = sorted(df["category"].unique())
+
+for category in categories:
+            connection.execute(
+                "INSERT INTO categories (category_name) VALUES (?)",
+                (category,),
+            )
+            
+category_lookup = {
+            row[1]: row[0]
+            for row in connection.execute(
+                "SELECT category_id, category_name FROM categories"
+            ).fetchall()
+        }
+
+insert_sql = """
+            INSERT INTO books (
+                title,
+                price_gbp,
+                price_inr,
+                rating,
+                in_stock,
+                category_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+               
+for row in df.itertuples(index=False):
+            connection.execute(
+                insert_sql,
+                (
+                    row.title,
+                    float(row.price_gbp),
+                    float(row.price_inr),
+                    int(row.rating),
+                    int(row.in_stock),
+                    category_lookup[row.category],
+                ),
+            )
+            
+connection.commit()
+
+finally:
+    
+connection.close()
+
+
+def run_sql_queries() -> dict[str, list[dict]]:
+    connection = sqlite3.connect(DB_PATH)
+
+    queries = {
+        "query_1_select_where": """
+            SELECT title, price_gbp, rating
+            FROM books
+            WHERE rating >= 4
+        """,
+        "query_2_order_by": """
+            SELECT title, price_gbp
+            FROM books
+            ORDER BY price_gbp DESC
+        """,
+        "query_3_limit": """
+            SELECT title, price_gbp, rating
+            FROM books
+            ORDER BY price_gbp DESC
+            LIMIT 10
+        """,
+        "query_4_distinct": """
+            SELECT DISTINCT c.category_name
+            FROM categories c
+            JOIN books b
+                ON b.category_id = c.category_id
+        """,
+        "query_5_between": """
+            SELECT title, price_gbp
+            FROM books
+            WHERE price_gbp BETWEEN 10 AND 30
+            ORDER BY price_gbp
+        """,
+        "query_6_join": """
+            SELECT
+                c.category_name,
+                b.title,
+                b.rating,
+                b.price_gbp
+            FROM books b
+            JOIN categories c
+                ON b.category_id = c.category_id
+            ORDER BY c.category_name, b.rating DESC, b.price_gbp DESC
+            LIMIT 10
+        """,
+    }
+
+    results = {}
+    
+    try:
+        for name, query in queries.items():
+            print("\n" + "=" * 80)
+            print(name)
+            print(query.strip())
+
+            result_df = pd.read_sql(query, connection)
+
+            print(result_df.to_string(index=False))
+
+            results[name] = result_df.to_dict(orient="records")
+            
+     finally:
+    
+        connection.close()
+        
+    return results
+
+def demonstrate_pands_equivalence() -> None:
+    connection = sqlite3.connect(DB_PATH)
+    
+    books_df = pd.read_sql(
+        """
+        SELECT
+            book_id,
+            title,
+            price_gbp,
+            price_inr,
+            rating,
+            in_stock,
+            category_id
+        FROM books
+        """,
+        connection,
+    )
+    
+    categories_df = pd.read_sql(
+        """
+        SELECT category_id, category_name
+        FROM categories
+        """,
+        connection,
+    )
+    
+    sql_join_df = pd.read_sql(
+        """
+        SELECT
+            c.category_name,
+            b.title,
+            b.rating,
+            b.price_gbp
+        FROM books b
+        JOIN categories c
+            ON b.category_id = c.category_id
+        ORDER BY c.category_name, b.rating DESC, b.price_gbp DESC
+        LIMIT 10
+        """,
+        connection,
+    )
+    
+    connection.close()
+    
+    pandas_join_df = (
+        books_df.merge(
+            categories_df,
+            on="category_id",
+            how="inner",
+        )
+        [
+            ["category_name", "title", "rating", "price_gbp"]
+        ]
+        .sort_values(
+            ["category_name", "rating", "price_gbp"],
+            ascending=[True, False, False],
+        )
+        .head(10)
+        .reset_index(drop=True)
+    )
+    
+    sql_normalized = sql_join_df.reset_index(drop=True)
+
+    equivalent = sql_normalized.equals(pandas_join_df)
+
+    print("\nSQL JOIN RESULT")
+    print(sql_normalized.to_string(index=False))
+
+    print("\nPANDAS MERGE RESULT")
+    print(pandas_join_df.to_string(index=False))
+
+    print(f"\nEquivalent: {equivalent}")
+
+    if not equivalent:
+        raise AssertionError("SQL JOIN and pandas merge results differ.")
+
+    sql_normalized.to_csv(
+        OUTPUT_DIR / "sql_join_output.csv",
+        index=False,
+    )
+
+    pandas_join_df.to_csv(
+        OUTPUT_DIR / "pandas_merge_output.csv",
+        index=False,
+    )
+
+
+def save_pipeline_outputs(df: pd.DataFrame, query_results: dict) -> None:
+    df.to_csv(OUTPUT_DIR / "cleaned_books.csv", index=False)
+
+    with open(
+        OUTPUT_DIR / "sql_query_outputs.json",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(query_results, file, indent=2, default=str)
+
+
+def main() -> None:
+    print("Starting Module 1 Data Pipeline")
+    print(f"Required fixed exchange rate: 1 GBP = {RATE_GBP_TO_INR} INR")
+
+    raw_df = scrape_books()
+    cleaned_df = clean_data(raw_df)
+
+    print("\nCleaned dataframe:")
+    print(cleaned_df.head().to_string(index=False))
+    print(f"\nFinal row count: {len(cleaned_df)}")
+    print(f"Categories: {cleaned_df['category'].nunique()}")
+
+    create_database(cleaned_df)
+
+    query_results = run_sql_queries()
+    demonstrate_pandas_equivalence()
+
+    save_pipeline_outputs(cleaned_df, query_results)
+
+    print("\nModule 1 completed successfully.")
+    print(f"Database: {DB_PATH}")
+    print(f"Outputs: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
+    
+    
+ 
+    
+    
