@@ -1,0 +1,763 @@
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    recall_score,
+    r2_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+
+warnings.filterwarnings("ignore")
+
+ROOT = Path(__file__).resolve().parent
+PLOT_DIR = ROOT / "plots"
+ARTIFACT_DIR = ROOT / "artifacts"
+
+PLOT_DIR.mkdir(exist_ok=True)
+ARTIFACT_DIR.mkdir(exist_ok=True)
+
+
+RANDOM_STATE = 42
+
+
+def load_cleaned_data() -> pd.DataFrame:
+    path = ROOT / "cleaned_titanic.csv"
+
+    if not path.exists():
+        raise FileNotFoundError(
+            "cleaned_titanic.csv does not exist. "
+            "Run 01_eda.py first."
+        )
+
+    return pd.read_csv(path)
+
+
+def build_preprocessor(
+    numeric_features: list[str],
+    categorical_features: list[str],
+) -> ColumnTransformer:
+
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+
+    categorical_pipeline = Pipeline(
+        steps=[
+            (
+                "imputer",
+                SimpleImputer(strategy="most_frequent"),
+            ),
+            (
+                "encoder",
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=False,
+                ),
+            ),
+        ]
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, numeric_features),
+            ("categorical", categorical_pipeline, categorical_features),
+        ],
+        remainder="drop",
+    )
+
+
+def evaluate_classifier(
+    name: str,
+    pipeline,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+) -> dict:
+    predictions = pipeline.predict(X_test)
+
+    if hasattr(pipeline, "predict_proba"):
+        probabilities = pipeline.predict_proba(X_test)[:, 1]
+    else:
+        probabilities = pipeline.decision_function(X_test)
+
+    cm = confusion_matrix(y_test, predictions)
+
+    accuracy = accuracy_score(y_test, predictions)
+    precision = precision_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+    recall = recall_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+    f1 = f1_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+    auc = roc_auc_score(y_test, probabilities)
+
+    print(f"\n{name}")
+    print("-" * 60)
+    print("Confusion matrix:")
+    print(cm)
+
+    print(
+        classification_report(
+            y_test,
+            predictions,
+            zero_division=0,
+        )
+    )
+
+    return {
+        "model": name,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "auc": auc,
+        "probabilities": probabilities,
+    }
+
+
+def classification_models(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    numeric_features,
+    categorical_features,
+):
+    models = {
+        "Logistic Regression": LogisticRegression(
+            max_iter=2000,
+            random_state=RANDOM_STATE,
+        ),
+        "Decision Tree": DecisionTreeClassifier(
+            max_depth=5,
+            random_state=RANDOM_STATE,
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=200,
+            random_state=RANDOM_STATE,
+        ),
+    }
+
+    pipelines = {}
+    results = []
+
+    for name, estimator in models.items():
+        preprocessor = build_preprocessor(
+            numeric_features,
+            categorical_features,
+        )
+
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("classifier", estimator),
+            ]
+        )
+
+        pipeline.fit(X_train, y_train)
+
+        result = evaluate_classifier(
+            name,
+            pipeline,
+            X_test,
+            y_test,
+        )
+
+        pipelines[name] = pipeline
+        results.append(result)
+
+    return pipelines, results
+
+
+def decision_tree_plot(
+    pipeline: Pipeline,
+) -> None:
+    preprocessor = pipeline.named_steps["preprocessor"]
+    classifier = pipeline.named_steps["classifier"]
+
+    feature_names = list(
+        preprocessor.get_feature_names_out()
+    )
+
+    plt.figure(figsize=(24, 12))
+
+    plot_tree(
+        classifier,
+        feature_names=feature_names,
+        class_names=["Not Survived", "Survived"],
+        filled=True,
+        rounded=True,
+        max_depth=4,
+        fontsize=8,
+    )
+
+    plt.title("Decision Tree")
+    plt.tight_layout()
+    plt.savefig(
+        PLOT_DIR / "05_decision_tree.png",
+        dpi=150,
+    )
+    plt.close()
+
+
+def roc_plot(
+    results: list[dict],
+    pipelines: dict,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+) -> None:
+    plt.figure(figsize=(9, 7))
+
+    for result in results:
+        name = result["model"]
+
+        fpr, tpr, _ = roc_curve(
+            y_test,
+            result["probabilities"],
+        )
+
+        plt.plot(
+            fpr,
+            tpr,
+            label=f"{name} AUC={result['auc']:.3f}",
+        )
+
+    plt.plot(
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        color="gray",
+    )
+
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(
+        PLOT_DIR / "06_roc_curves.png",
+        dpi=150,
+    )
+    plt.close()
+
+
+def imbalance_comparison(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    numeric_features,
+    categorical_features,
+):
+    print("\nCLASS BALANCE")
+    print(y_train.value_counts(normalize=True))
+
+    variants = {}
+
+    baseline_preprocessor = build_preprocessor(
+        numeric_features,
+        categorical_features,
+    )
+
+    variants["baseline"] = Pipeline(
+        steps=[
+            ("preprocessor", baseline_preprocessor),
+            (
+                "classifier",
+                LogisticRegression(
+                    max_iter=2000,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+    balanced_preprocessor = build_preprocessor(
+        numeric_features,
+        categorical_features,
+    )
+
+    variants["class_weight_balanced"] = Pipeline(
+        steps=[
+            ("preprocessor", balanced_preprocessor),
+            (
+                "classifier",
+                LogisticRegression(
+                    max_iter=2000,
+                    class_weight="balanced",
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+    smote_preprocessor = build_preprocessor(
+        numeric_features,
+        categorical_features,
+    )
+
+    variants["smote_training_only"] = ImbPipeline(
+        steps=[
+            ("preprocessor", smote_preprocessor),
+            ("smote", SMOTE(random_state=RANDOM_STATE)),
+            (
+                "classifier",
+                LogisticRegression(
+                    max_iter=2000,
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+    rows = []
+
+    for name, model in variants.items():
+        model.fit(X_train, y_train)
+
+        predictions = model.predict(X_test)
+
+        rows.append(
+            {
+                "strategy": name,
+                "precision": precision_score(
+                    y_test,
+                    predictions,
+                    zero_division=0,
+                ),
+                "recall": recall_score(
+                    y_test,
+                    predictions,
+                    zero_division=0,
+                ),
+                "f1": f1_score(
+                    y_test,
+                    predictions,
+                    zero_division=0,
+                ),
+            }
+        )
+
+    comparison = pd.DataFrame(rows)
+
+    print("\nIMBALANCE COMPARISON")
+    print(comparison.to_string(index=False))
+
+    comparison.to_csv(
+        ROOT / "imbalance_comparison.csv",
+        index=False,
+    )
+
+def grid_search_random_forest(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    numeric_features,
+    categorical_features,
+):
+    preprocessor = build_preprocessor(
+        numeric_features,
+        categorical_features,
+    )
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            (
+                "classifier",
+                RandomForestClassifier(
+                    oob_score=True,
+                    random_state=RANDOM_STATE,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    param_grid = {
+        "classifier__n_estimators": [100, 200],
+        "classifier__max_depth": [None, 5, 10],
+        "classifier__max_features": ["sqrt", "log2"],
+    }
+
+    search = GridSearchCV(
+        pipeline,
+        param_grid=param_grid,
+        cv=5,
+        scoring="f1",
+        n_jobs=-1,
+    )
+
+    search.fit(X_train, y_train)
+
+    best_pipeline = search.best_estimator_
+
+    forest = best_pipeline.named_steps["classifier"]
+
+    print("\nGRID SEARCH")
+    print("Best parameters:")
+    print(search.best_params_)
+    print(f"OOB score: {forest.oob_score_:.4f}")
+
+    with open(
+        ROOT / "grid_search_results.txt",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(f"Best parameters: {search.best_params_}\n")
+        file.write(f"OOB score: {forest.oob_score_:.6f}\n")
+
+    return best_pipeline
+
+
+def regression_task(df: pd.DataFrame):
+    
+    data = df.copy()
+
+    target = data["fare"]
+
+    features = data.drop(columns=["fare"])
+
+    numeric = [
+        column
+        for column in features.columns
+        if pd.api.types.is_numeric_dtype(features[column])
+    ]
+
+    categorical = [
+        column
+        for column in features.columns
+        if column not in numeric
+    ]
+    
+    remove = [
+        column
+        for column in ["alive", "adult_male", "alone"]
+        if column in features.columns
+    ]
+
+    features = features.drop(columns=remove)
+
+    numeric = [
+        column
+        for column in numeric
+        if column not in remove
+    ]
+
+    categorical = [
+        column
+        for column in categorical
+        if column not in remove
+    ]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        features,
+        target,
+        test_size=0.20,
+        random_state=RANDOM_STATE,
+    )
+
+    preprocessor = build_preprocessor(
+        numeric,
+        categorical,
+    )
+
+    model = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("regressor", LinearRegression()),
+        ]
+    )
+
+    model.fit(X_train, y_train)
+
+    predictions = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, predictions)
+    rmse = np.sqrt(
+        mean_squared_error(y_test, predictions)
+    )
+    r2 = r2_score(y_test, predictions)
+
+    n = len(y_test)
+
+    transformed_X_test = (
+        model.named_steps["preprocessor"]
+        .transform(X_test)
+    )
+
+    p = transformed_X_test.shape[1]
+
+    if n - p - 1 > 0:
+        adjusted_r2 = (
+            1
+            - (1 - r2)
+            * (n - 1)
+            / (n - p - 1)
+        )
+    else:
+        adjusted_r2 = np.nan
+
+    residuals = y_test - predictions
+
+    plt.figure(figsize=(9, 6))
+    sns.scatterplot(
+        x=predictions,
+        y=residuals,
+    )
+    plt.axhline(
+        0,
+        color="red",
+        linestyle="--",
+    )
+    plt.xlabel("Predicted Fare")
+    plt.ylabel("Residual")
+    plt.title("Fare Regression Residual Plot")
+    plt.tight_layout()
+    plt.savefig(
+        PLOT_DIR / "07_regression_residuals.png",
+        dpi=150,
+    )
+    plt.close()
+
+    print("\nREGRESSION METRICS")
+    print(f"MAE: {mae:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"R²: {r2:.4f}")
+    print(f"Adjusted R²: {adjusted_r2:.4f}")
+return {
+        "model": "Linear Regression",
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "adjusted_r2": adjusted_r2,
+    }
+
+
+def save_final_pipeline(pipeline: Pipeline) -> None:
+    path = ARTIFACT_DIR / "best_classifier_pipeline.joblib"
+
+    joblib.dump(
+        pipeline,
+        path,
+    )
+
+    print(f"\nSaved complete pipeline: {path}")
+
+    loaded = joblib.load(path)
+
+    print(
+        "Reload validation completed. "
+        "The artifact contains preprocessing and estimator."
+    )
+
+    return loaded
+
+
+def main():
+    df = load_cleaned_data()
+
+    target = df["survived"]
+
+    features = df.drop(
+        columns=["survived", "alive"],
+        errors="ignore",
+    )
+
+    # Remove redundant derived fields from the predictive feature set.
+    features = features.drop(
+        columns=["adult_male", "alone"],
+        errors="ignore",
+    )
+
+    numeric_features = [
+        "pclass",
+        "age",
+        "sibsp",
+        "parch",
+        "fare",
+    ]
+
+    categorical_features = [
+        "sex",
+        "embarked",
+    ]
+
+    X = features[
+        numeric_features + categorical_features
+    ]
+
+    y = target
+
+    print("\nCLASS DISTRIBUTION")
+    print(y.value_counts())
+    print(y.value_counts(normalize=True))
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        stratify=y,
+        random_state=RANDOM_STATE,
+    )
+    
+pipelines, results = classification_models(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        numeric_features,
+        categorical_features,
+    )
+
+decision_tree_plot(
+        pipelines["Decision Tree"]
+    )
+
+roc_plot(
+        results,
+        pipelines,
+        X_test,
+        y_test,
+    )
+
+    comparison = pd.DataFrame(
+        [
+            {
+                key: value
+                for key, value in result.items()
+                if key != "probabilities"
+            }
+            for result in results
+        ]
+    )
+
+    print("\nCLASSIFICATION COMPARISON")
+    print(comparison.to_string(index=False))
+
+    comparison.to_csv(
+        ROOT / "classification_comparison.csv",
+        index=False,
+    )
+
+    imbalance_comparison(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        numeric_features,
+        categorical_features,
+    )
+
+    best_rf = grid_search_random_forest(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        numeric_features,
+        categorical_features,
+    )
+
+    regression_results = regression_task(df)
+
+    classification_table = comparison[
+        [
+            "model",
+            "accuracy",
+            "precision",
+            "recall",
+            "f1",
+            "auc",
+        ]
+    ].copy()
+
+    regression_table = pd.DataFrame(
+        [
+            regression_results
+        ]
+    )
+
+    print("\nFINAL MODEL COMPARISON")
+    print("\nClassification metrics:")
+    print(
+        classification_table.to_string(
+            index=False
+        )
+    )
+
+    print("\nRegression metrics:")
+    print(
+        regression_table.to_string(
+            index=False
+        )
+    )
+
+    # Select the deployment model by F1 as a transparent classification
+    # criterion, while retaining the complete preprocessing pipeline.
+    best_model_name = (
+        comparison.sort_values(
+            "f1",
+            ascending=False,
+        )
+        .iloc[0]["model"]
+    )
+
+    best_pipeline = pipelines[best_model_name]
+
+    print(
+        f"\nDeployment model selected using highest test F1: "
+        f"{best_model_name}"
+    )
+    loaded_pipeline = save_final_pipeline(
+        best_pipeline
+    )
+
+sample_prediction = loaded_pipeline.predict(
+        X_test.iloc[:3]
+    )
+
+print("\nReloaded pipeline sample predictions:")
+print(sample_prediction)
+
+
+if __name__ == "__main__":
+    main()  
